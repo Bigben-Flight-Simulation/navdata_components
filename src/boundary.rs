@@ -11,19 +11,20 @@
 //! `centered on …`、`centre at …` 等）的坐标是圆心，它前后的描述文字按槽位识别，
 //! 各槽位的先后顺序任意：
 //!
-//! - 半径：`半径 5.5km`、`radius of 5.5 km`、`R=3NM`、`5 NM radius`；单位为
+//! - 半径：`半径 5.5km`、`5.6KM 为半径`、`radius of 5.5 km`、`R=3NM`、`5 NM radius`；单位为
 //!   km/kilometres/公里/千米、NM/nautical miles/海里、m/metres/米；
 //! - 方向：顺时针/clockwise/CW，逆时针/反时针/counterclockwise/anticlockwise/CCW；
-//! - 带方向的描述是圆弧，起点和终点取前后相邻的坐标点（首段圆弧从最后一个点出发，
-//!   末段圆弧回到第一个点）；只有圆心和半径的描述是整圆。
+//! - 提到弧（弧/arc）或写明方向的描述是圆弧，起点和终点取前后相邻的坐标点（首段圆弧
+//!   从最后一个点出发，末段圆弧回到第一个点）；未注明方向的圆弧取两端点之间较短的一侧，
+//!   并给出 [`BoundaryWarning::ShorterArc`]。只有圆心和半径的描述是整圆。
 //!
-//! 片段之间用 `- － — ~ ; 至 到 to then thence` 分隔，`起点`、`point of origin` 等收尾词
-//! 会被略过。其余文字（例如「沿国境线」「along the FIR boundary」）作为
+//! 片段之间用 `- － — ~ ; 至 到 to then thence` 及 `1.`、`2、` 等列表编号分隔，`点`、
+//! `起点`、`point of origin` 等引导词和收尾词会被略过。其余文字（例如「沿国境线」「along the FIR boundary」）作为
 //! [`BoundaryPart::Unresolved`] 保留，展开时用直线连接其前后两点，并在
 //! [`BoundaryPath::unresolved`] 中标出这一段。
 //!
 //! 从 PDF 复制的文本常在坐标中间换行（`N374434E113⏎2200`）：两个数字之间的换行直接
-//! 删除，其余换行视为空格。
+//! 删除（下一行以 `1.`、`2、` 等编号开头时除外），其余换行视为空格。
 
 use crate::algorithm::measurement::{get_azimuth, get_distance};
 use crate::algorithm::shape::{arc, circle, ArcDirection};
@@ -38,11 +39,11 @@ use std::fmt::{Display, Formatter};
 pub enum BoundaryPart {
     /// 边界上的一个点
     Point(Coordinate),
-    /// 从前一个点沿圆弧到后一个点
+    /// 从前一个点沿圆弧到后一个点；`direction` 为 `None` 时取较短的一侧
     Arc {
         center: Coordinate,
         radius: f64,
-        direction: ArcDirection,
+        direction: Option<ArcDirection>,
     },
     /// 整圆
     Circle { center: Coordinate, radius: f64 },
@@ -91,8 +92,8 @@ pub struct BoundaryPath {
     pub points: Vec<Coordinate>,
     /// 由未解析文字连接的边：`points[from]` 到 `points[from + 1]`
     pub unresolved: Vec<UnresolvedEdge>,
-    /// 圆弧端点到圆心的距离与半径相差超过 max(10%, 500 m) 的情况
-    pub warnings: Vec<ArcWarning>,
+    /// 需要对照原图核实的圆弧
+    pub warnings: Vec<BoundaryWarning>,
 }
 
 /// 用直线代替的一段边界。
@@ -102,22 +103,37 @@ pub struct UnresolvedEdge {
     pub text: String,
 }
 
-/// 圆弧端点偏离半径。
+/// 需要对照原图核实的圆弧。`Display` 输出中文说明。
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ArcWarning {
-    pub point: Coordinate,
-    pub radius: f64,
-    pub distance: f64,
+pub enum BoundaryWarning {
+    /// 圆弧端点到圆心的距离与半径相差超过 max(10%, 500 m)
+    OffRadius {
+        point: Coordinate,
+        radius: f64,
+        distance: f64,
+    },
+    /// 圆弧未注明方向，按两端点之间较短的一侧绘制
+    ShorterArc { center: Coordinate },
 }
 
-impl Display for ArcWarning {
+impl Display for BoundaryWarning {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "圆弧端点距圆心 {:.3} km，半径为 {:.3} km",
-            self.distance / 1000.0,
-            self.radius / 1000.0
-        )
+        match self {
+            BoundaryWarning::OffRadius {
+                radius, distance, ..
+            } => write!(
+                f,
+                "圆弧端点距圆心 {:.3} km，半径为 {:.3} km",
+                distance / 1000.0,
+                radius / 1000.0
+            ),
+            BoundaryWarning::ShorterArc { .. } => {
+                write!(
+                    f,
+                    "圆弧未注明方向，按较短一侧绘制；原文写明顺时针或逆时针可改变走向"
+                )
+            }
+        }
     }
 }
 
@@ -128,6 +144,9 @@ const UNIT: &str =
 
 lazy_static! {
     static ref RE_COORD: Regex = Regex::new(COORD).unwrap();
+    static ref RE_NUMBERED_BREAK: Regex =
+        Regex::new(r"(\d)[ \t]*\r?\n([ \t]*\d{1,3}\s*[.、)）]\s)").unwrap();
+    static ref RE_NUMBERING: Regex = Regex::new(r"(^|\s)\d{1,3}\s*[.、)）](\s)").unwrap();
     static ref RE_DIGIT_BREAK: Regex = Regex::new(r"(\d)[ \t]*\r?\n[ \t]*(\d)").unwrap();
     static ref RE_BREAK: Regex = Regex::new(r"\s*\r?\n\s*").unwrap();
     static ref RE_COUNTER_SPLIT: Regex =
@@ -146,13 +165,13 @@ lazy_static! {
     ))
     .unwrap();
     static ref RE_RADIUS_AFTER: Regex =
-        Regex::new(&format!(r"(\d+(?:\.\d+)?)\s*{UNIT}\s*(?:的)?\s*(?:RADIUS|半径)")).unwrap();
+        Regex::new(&format!(r"(\d+(?:\.\d+)?)\s*{UNIT}\s*(?:为|作为|是)?\s*(?:的)?\s*(?:RADIUS|半径)")).unwrap();
     static ref RE_COUNTER: Regex =
         Regex::new(r"COUNTERCLOCKWISE|ANTICLOCKWISE|\bCCW\b|逆时针|反时针").unwrap();
     static ref RE_CLOCKWISE: Regex = Regex::new(r"CLOCKWISE|\bCW\b|顺时针").unwrap();
     static ref RE_ARC: Regex = Regex::new(r"ARC|弧").unwrap();
     static ref RE_FILLER: Regex = Regex::new(
-        r"[\s,，、.。:：()（）]+|起点|终点|回|返回|闭合|然后|再|经|从|自|直线|连线|\b(?:BACK|POINT|OF|ORIGIN|BEGINNING|START(?:ING)?|FROM|THE|A|AN|AT|AND|STRAIGHT|LINE|VIA)\b"
+        r"[\s,，、.。:：()（）]+|起点|终点|回|返回|闭合|然后|再|经|从|自|直线|连线|坐标|点|\b(?:BACK|POINT|OF|ORIGIN|BEGINNING|START(?:ING)?|FROM|THE|A|AN|AT|AND|STRAIGHT|LINE|VIA)\b"
     )
     .unwrap();
 }
@@ -160,8 +179,12 @@ lazy_static! {
 /// 统一大小写、连字符和换行，便于后续匹配。
 fn normalize(text: &str) -> String {
     let text = text.to_uppercase();
+    // 下一行以「1.」「2、」等编号开头时是正常换行，其余数字间的换行是 PDF 断行。
+    let text = RE_NUMBERED_BREAK.replace_all(&text, "$1 $2");
     let text = RE_DIGIT_BREAK.replace_all(&text, "$1$2");
     let text = RE_BREAK.replace_all(&text, " ");
+    // 列表编号作为分隔符。
+    let text = RE_NUMBERING.replace_all(&text, "$1;$2");
     let text = RE_COUNTER_SPLIT.replace_all(&text, "${1}CLOCKWISE");
     RE_CLOCK_SPLIT.replace_all(&text, "CLOCKWISE").into_owned()
 }
@@ -228,17 +251,17 @@ fn radial(
     } else {
         None
     };
-    Ok(match direction {
-        Some(direction) => BoundaryPart::Arc {
+    Ok(if direction.is_some() || RE_ARC.is_match(description) {
+        BoundaryPart::Arc {
             center,
             radius: metres,
             direction,
-        },
-        None if RE_ARC.is_match(description) => BoundaryPart::Unresolved(original),
-        None => BoundaryPart::Circle {
+        }
+    } else {
+        BoundaryPart::Circle {
             center,
             radius: metres,
-        },
+        }
     })
 }
 
@@ -374,19 +397,29 @@ pub fn boundary_path(parts: &[BoundaryPart], max_step: f64) -> Result<BoundaryPa
                     if !distance.is_finite()
                         || (distance - radius).abs() > (radius * 0.1).max(500.0)
                     {
-                        warnings.push(ArcWarning {
+                        warnings.push(BoundaryWarning::OffRadius {
                             point,
                             radius: *radius,
                             distance,
                         });
                     }
                 }
+                let (start_bearing, end_bearing) =
+                    (get_azimuth(center, &from), get_azimuth(center, &to));
+                let direction = direction.unwrap_or_else(|| {
+                    warnings.push(BoundaryWarning::ShorterArc { center: *center });
+                    if (end_bearing - start_bearing).rem_euclid(360.0) <= 180.0 {
+                        ArcDirection::Clockwise
+                    } else {
+                        ArcDirection::CounterClockwise
+                    }
+                });
                 let vertices = arc(
                     center,
                     *radius,
-                    get_azimuth(center, &from),
-                    get_azimuth(center, &to),
-                    *direction,
+                    start_bearing,
+                    end_bearing,
+                    direction,
                     max_step,
                 );
                 if start.is_none() {

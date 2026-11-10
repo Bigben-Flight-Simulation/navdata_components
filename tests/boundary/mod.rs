@@ -3,6 +3,7 @@ use navdata_components::algorithm::position_transformation::get_colocated_coord;
 use navdata_components::algorithm::shape::ArcDirection;
 use navdata_components::boundary::{
     boundary_path, parse_boundary, parse_boundary_path, BoundaryError, BoundaryPart,
+    BoundaryWarning,
 };
 use navdata_components::coordinate::Coordinate;
 use navdata_components::format::CoordinateFormat;
@@ -40,7 +41,7 @@ fn arc_of(part: &BoundaryPart) -> (f64, ArcDirection) {
             direction,
         } => {
             assert_eq!(*center, CENTER);
-            (*radius, *direction)
+            (*radius, direction.expect("arc direction"))
         }
         other => panic!("{other:?}"),
     }
@@ -268,16 +269,6 @@ fn unresolved_text_becomes_a_marked_straight_edge() {
     assert_eq!(path.points[0], path.points[3]);
     assert_eq!(path.unresolved[0].from, 2);
     assert_eq!(path.unresolved[0].text, "ALONG THE FIR BOUNDARY");
-
-    // 没写方向的圆弧也按直线连接并标出
-    let text = format!(
-        "{}－以{C}为圆心，半径5.5km的弧－{}",
-        at(0.0, 5_500.0),
-        at(90.0, 5_500.0)
-    );
-    let path = parse_boundary_path(&text, 1.0).unwrap();
-    assert_eq!(path.points.len(), 2);
-    assert!(path.unresolved[0].text.contains("圆心"));
 }
 
 #[test]
@@ -289,9 +280,15 @@ fn arc_endpoints_far_from_the_radius_are_reported() {
     );
     let path = parse_boundary_path(&text, 1.0).unwrap();
     assert_eq!(path.warnings.len(), 1);
-    near(path.warnings[0].distance, 8_000.0, 31.0);
-    let mut warning = path.warnings[0];
-    warning.distance = 8_000.0;
+    let BoundaryWarning::OffRadius { distance, .. } = path.warnings[0] else {
+        panic!("{:?}", path.warnings);
+    };
+    near(distance, 8_000.0, 31.0);
+    let warning = BoundaryWarning::OffRadius {
+        point: CENTER,
+        radius: 5_500.0,
+        distance: 8_000.0,
+    };
     assert_eq!(
         warning.to_string(),
         "圆弧端点距圆心 8.000 km，半径为 5.500 km"
@@ -325,4 +322,37 @@ fn errors() {
         ),
         Err(BoundaryError::CircleMixedWithPoints)
     );
+}
+
+/// 一行一项、带「点」或编号引导词、半径写在「为半径」之前、未注明方向的圆弧。
+#[test]
+fn listed_items_and_arcs_without_direction() {
+    let text = "点 N303923 E1144948\n点 N303924 E1145629\n以 N303821 E1145946 为圆心，5.6KM 为半径的弧\n点 N303926 E1150303\n1. N302901 E1150554";
+    let parts = parse_boundary(text).unwrap();
+    assert_eq!(parts.len(), 5, "{parts:?}");
+    let BoundaryPart::Arc {
+        center,
+        radius,
+        direction: None,
+    } = parts[2]
+    else {
+        panic!("{parts:?}");
+    };
+    near(radius, 5_600.0, 1e-9);
+    let path = boundary_path(&parts, 1.0).unwrap();
+    assert!(path.unresolved.is_empty(), "{:?}", path.unresolved);
+    assert_eq!(path.warnings, [BoundaryWarning::ShorterArc { center }]);
+    // 两端点在圆心西北和东北，较短的一侧经过正北
+    let arc = &path.points[2..path.points.len() - 2];
+    assert!((135..=145).contains(&arc.len()), "{}", arc.len());
+    assert!(arc
+        .iter()
+        .map(|p| get_azimuth(&center, p))
+        .any(|b| !(1.0..359.0).contains(&b)));
+
+    // 写明方向时按原文走另一侧
+    let text = text.replace("的弧", "逆时针的弧");
+    let path = parse_boundary_path(&text, 1.0).unwrap();
+    assert!(path.warnings.is_empty());
+    assert!(path.points.len() > 200, "{}", path.points.len());
 }
